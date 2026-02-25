@@ -1,0 +1,27 @@
+# Security (Critical)
+.env
+
+# Databases
+data/*.db
+data/*.sqlite3
+
+# Python Caches & Compiled Files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Logs
+*.log
+
+# VS Code Workspace Settings
+.vscode/
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
