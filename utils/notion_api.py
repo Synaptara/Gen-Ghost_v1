@@ -11,33 +11,11 @@ DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
 notion = AsyncClient(auth=NOTION_API_KEY)
 
-# Memory cache for the new Notion API 2025-09-03 Architecture
-_cached_data_source_id = None
-
-
-async def get_data_source_id():
-    """Fetches the new hidden data_source_id from the parent Database."""
-    global _cached_data_source_id
-    if _cached_data_source_id:
-        return _cached_data_source_id
-
-    try:
-        db = await notion.databases.retrieve(database_id=DATABASE_ID)
-        _cached_data_source_id = db["data_sources"][0]["id"]
-        return _cached_data_source_id
-    except Exception as e:
-        logger.error(f"Failed to fetch data_source_id: {e}")
-        return None
-
 
 async def add_task(day_title: str, topic: str) -> bool:
-    ds_id = await get_data_source_id()
-    if not ds_id:
-        return False
-
     try:
         await notion.pages.create(
-            parent={"type": "data_source_id", "data_source_id": ds_id},
+            parent={"type": "database_id", "database_id": DATABASE_ID},
             properties={
                 "Day": {"title": [{"text": {"content": day_title}}]},
                 "Topic": {"rich_text": [{"text": {"content": topic}}]},
@@ -54,13 +32,9 @@ async def add_task(day_title: str, topic: str) -> bool:
 
 
 async def get_next_pending_task() -> dict | None:
-    ds_id = await get_data_source_id()
-    if not ds_id:
-        return None
-
     try:
-        response = await notion.data_sources.query(
-            data_source_id=ds_id,
+        response = await notion.databases.query(
+            database_id=DATABASE_ID,
             filter={
                 "or": [
                     {"property": "Status", "select": {"equals": "Pending"}},
@@ -128,12 +102,8 @@ async def update_task_completion(page_id: str, time_spent_mins: int) -> bool:
 
 
 async def get_progress_stats() -> dict:
-    ds_id = await get_data_source_id()
-    if not ds_id:
-        return {"total": 0, "completed": 0, "in_progress": 0, "percentage": 0}
-
     try:
-        response = await notion.data_sources.query(data_source_id=ds_id)
+        response = await notion.databases.query(database_id=DATABASE_ID)
         results = response.get("results", [])
 
         total = len(results)
