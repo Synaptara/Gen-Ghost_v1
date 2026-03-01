@@ -11,7 +11,6 @@ import logging
 import re
 from ddgs import DDGS
 from utils.ghost_ui import ChatDeleteConfirmView, CreateRepoView, DeployConfirmView
-from utils.ghost_scraper import execute_scraping
 
 logger = logging.getLogger("GhostCommander")
 
@@ -178,19 +177,19 @@ GHOST_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "scrape_website",
-            "description": "Scrape a website URL and extract specific information using AI.",
+            "name": "trigger_job_sweep",
+            "description": "Trigger an ATS job sweep for a specific role and location.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {
+                    "role": {
                         "type": "string",
                     },
-                    "extraction_query": {
+                    "location": {
                         "type": "string",
                     },
                 },
-                "required": ["url", "extraction_query"],
+                "required": ["role", "location"],
             },
         },
     },
@@ -629,29 +628,15 @@ async def execute_tool(
                 }
             )
 
-        elif function_name == "scrape_website":
-            url = args.get("url", "")
-            query = args.get("extraction_query", "")
-
-            if (
-                not url
-                or url.lower() in ["example.com", "https://example.com"]
-                or not re.match(
-                    r"^https?://[^\s/$.?#].[^\s]*$", url.strip(), re.IGNORECASE
-                )
-            ):
-                await message.channel.send(
-                    "🛑 **Invalid Target.** Sir, the provided URL is invalid. Please supply a correctly formatted HTTP or HTTPS link."
-                )
-                return json.dumps(
-                    {
-                        "status": "ABORTED",
-                        "message": "User failed to provide a valid URL.",
-                    }
-                )
-
-            asyncio.create_task(execute_scraping(message, url, query, groq_client))
-            return json.dumps({"status": "PENDING", "message": "Scraping UI spawned."})
+        elif function_name == "trigger_job_sweep":
+            role = args.get("role", "Data Scientist")
+            location = args.get("location", "Remote")
+            return json.dumps(
+                {
+                    "status": "SUCCESS",
+                    "message": f'SYSTEM ALERT: Instruct the user to use the slash command `/hunt role: "{role}" location: "{location}"` to execute the ATS visual job sweep UI.',
+                }
+            )
 
         elif function_name == "web_search":
             query = args.get("query")
@@ -710,7 +695,6 @@ async def execute_tool(
                 )
                 headers = raw_response.headers
 
-                # Check for standard headers first, fallback to '-day' headers if missing
                 req_rem = int(
                     headers.get("x-ratelimit-remaining-requests")
                     or headers.get("x-ratelimit-remaining-requests-day", 0)

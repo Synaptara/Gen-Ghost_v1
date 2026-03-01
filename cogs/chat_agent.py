@@ -14,6 +14,9 @@ from utils.ghost_tools import GHOST_TOOLS, execute_tool
 
 logger = logging.getLogger("GhostCommander")
 
+# Fetch the allowed chat channel ID from the environment
+CHAT_CHANNEL_ID = int(os.getenv("CHAT_CHANNEL_ID", 0))
+
 
 class ChatAgent(commands.Cog):
     def __init__(self, bot):
@@ -126,7 +129,12 @@ class ChatAgent(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        # Ignore bots
         if message.author.bot:
+            return
+
+        # STRICT CHANNEL LOCK: Only process messages in the designated chat channel
+        if message.channel.id != CHAT_CHANNEL_ID:
             return
 
         user_text = message.content.strip()

@@ -1,232 +1,295 @@
-import discord
 import aiohttp
 from bs4 import BeautifulSoup
 import logging
-import json
-import traceback
+import asyncio
 import re
+from ddgs import DDGS
 
 logger = logging.getLogger("GhostCommander")
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
 
-async def safe_ai_call(
-    groq_client, prompt, model="llama-3.3-70b-versatile", response_format=None
-):
-    kwargs = {
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are G.H.O.S.T., an advanced, highly efficient AI data extractor. Extract exactly what is requested with absolute precision. Strictly limit your text response to a maximum of 3 sentences. Zero conversational filler.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "model": model,
-        "max_tokens": 800,
-    }
-    if response_format:
-        kwargs["response_format"] = response_format
-
-    try:
-        res = await groq_client.chat.completions.create(**kwargs)
-        return res.choices[0].message.content
-    except Exception as e:
-        logger.warning(f"Scraper AI Primary Model choked: {e}")
-        try:
-            kwargs["model"] = "llama-3.1-8b-instant"
-            res = await groq_client.chat.completions.create(**kwargs)
-            return res.choices[0].message.content
-        except Exception as fallback_e:
-            logger.error(f"Scraper AI Fallback Model choked: {fallback_e}")
-            raise Exception(
-                "Both primary and fallback language models failed to process the target text."
-            )
+# 1. Global Cache & Config
+MAX_CONCURRENCY = 5
+MAX_RETRIES = 2
+_url_cache = set()
 
 
-class ScraperDropdown(discord.ui.Select):
-    def __init__(self, raw_text, groq_client, url, dynamic_actions):
-        self.raw_text = raw_text
-        self.groq = groq_client
-        self.url = url
-        self.action_prompts = {}
-
-        options = []
-        for i, action in enumerate(dynamic_actions):
-            val = str(i)
-            self.action_prompts[val] = action.get(
-                "prompt", "Summarize this data concisely in under 3 sentences."
-            )
-            options.append(
-                discord.SelectOption(
-                    label=action.get("label", "Analyze")[:25],
-                    description=action.get("description", "Perform data analysis")[:50],
-                    emoji="⚡",
-                    value=val,
-                )
-            )
-
-        super().__init__(
-            placeholder="Select a follow-up analysis protocol, sir...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        selected_action_prompt = self.action_prompts[self.values[0]]
-
-        msg = await interaction.followup.send(
-            "⏳ **Processing your request. Please stand by...**", ephemeral=True
-        )
-        full_prompt = f"{selected_action_prompt}\n\nCONTENT:\n{self.raw_text[:8000]}"
-
-        try:
-            answer = await safe_ai_call(self.groq, full_prompt)
-            embed = discord.Embed(
-                title="🔍 Analysis Complete",
-                description=answer[:4096],
-                color=discord.Color.dark_purple(),
-            )
-            await msg.edit(content=None, embed=embed)
-        except Exception as e:
-            logger.error(f"Scraper Dropdown Crash: {traceback.format_exc()}")
-            await msg.edit(
-                content="❌ **Processing Failed.** I was unable to complete the analysis on this specific data segment, sir."
-            )
+def is_entry_level(title: str) -> bool:
+    title_lower = title.lower()
+    senior_terms = [
+        r"\bsenior\b",
+        r"\bsr\.?\b",
+        r"\blead\b",
+        r"\bprincipal\b",
+        r"\bstaff\b",
+        r"\bmanager\b",
+        r"\bdirector\b",
+        r"\bhead\b",
+        r"\bvp\b",
+        r"\bii\b",
+        r"\biii\b",
+        r"\biv\b",
+        r"\bexperienced\b",
+    ]
+    return not any(re.search(term, title_lower) for term in senior_terms)
 
 
-class ScraperProgressView(discord.ui.View):
-    def __init__(self, raw_text, groq_client, url, dynamic_actions):
-        super().__init__(timeout=300)
-        self.add_item(ScraperDropdown(raw_text, groq_client, url, dynamic_actions))
+def match_role_and_location(
+    job_title: str, job_loc: str, target_role: str, target_loc: str
+) -> bool:
+    """Flexible matching using regex and partial word overlaps."""
+    target_role_clean = target_role.replace('"', "").lower()
+    target_loc_clean = target_loc.replace('"', "").lower()
+    title_lower = job_title.lower()
+    loc_lower = job_loc.lower()
 
-
-async def execute_scraping(
-    message: discord.Message, url: str, extraction_query: str, groq_client
-):
-    if not url or not re.match(
-        r"^https?://[^\s/$.?#].[^\s]*$", url.strip(), re.IGNORECASE
-    ):
-        return await message.channel.send(
-            "🛑 **Invalid URL.** Please provide a properly formatted HTTP or HTTPS link for the extraction protocol, sir."
-        )
-
-    embed = discord.Embed(
-        title="🌐 Web Extraction Protocol",
-        description="⏳ **Phase 1/4:** Establishing connection to the target server...",
-        color=discord.Color.blurple(),
+    # Role Match: Check if any major keyword from the target role exists in the title
+    role_keywords = [w for w in target_role_clean.split() if len(w) > 2]
+    role_match = (
+        any(word in title_lower for word in role_keywords)
+        or target_role_clean in title_lower
     )
-    status_msg = await message.channel.send(embed=embed)
+
+    # Location Match: Check for explicit remote or target location
+    loc_match = (
+        "remote" in loc_lower
+        or "worldwide" in loc_lower
+        or "anywhere" in loc_lower
+        or target_loc_clean in loc_lower
+    )
+
+    return role_match and loc_match
+
+
+async def fetch_html(
+    session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, url: str
+) -> str | None:
+    """Fetches HTML with Semaphore concurrency limit, retries, and backoff."""
+    clean_url = url.split("?")[0]
+
+    # 2. In-Memory Caching (Prevents double-fetching)
+    if clean_url in _url_cache:
+        return None
+    _url_cache.add(clean_url)
+
+    async with semaphore:
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                async with session.get(clean_url, headers=HEADERS, timeout=15) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+                    else:
+                        logger.warning(f"HTTP {resp.status} - {clean_url}")
+                        if resp.status in [403, 404]:
+                            return None  # Do not retry hard blocks or missing pages
+            except Exception as e:
+                if attempt < MAX_RETRIES:
+                    backoff = 2**attempt
+                    logger.info(
+                        f"Fetch failed, retrying {clean_url} in {backoff}s... (Attempt {attempt+1})"
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.error(f"Max retries reached for {clean_url}: {e}")
+    return None
+
+
+async def extract_ats_data(
+    session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, url: str
+) -> dict | None:
+    html = await fetch_html(session, semaphore, url)
+    if not html:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    title, company = "Unknown Role", "Unknown Company"
+
+    # 3. Robust ATS Parsing with Fallbacks
+    try:
+        if "greenhouse.io" in url:
+            title_el = soup.find("h1", class_="app-title") or soup.find("h1")
+            company_el = soup.find("span", class_="company-name") or soup.find("h2")
+            if title_el:
+                title = title_el.text.strip()
+            if company_el:
+                company = company_el.text.replace("at", "").strip()
+
+        elif "lever.co" in url:
+            title_el = soup.find("h2") or soup.find("h1")
+            if title_el:
+                title = title_el.text.strip()
+            page_title = soup.title.string if soup.title else ""
+            company = (
+                page_title.split("-")[0].strip()
+                if "-" in page_title
+                else page_title.strip()
+            )
+
+        elif "ashbyhq.com" in url:
+            title_el = soup.find("h1")
+            if title_el:
+                title = title_el.text.strip()
+            page_title = soup.title.string if soup.title else ""
+            company = (
+                page_title.split("-")[0].strip()
+                if "-" in page_title
+                else "Unknown Company"
+            )
+
+        elif "workable.com" in url or "breezy.hr" in url:
+            title_el = soup.find("h1") or soup.find("h2", class_="title")
+            company_el = soup.find("h2") or soup.find("strong")
+            if title_el:
+                title = title_el.text.strip()
+            if company_el:
+                company = company_el.text.strip()
+
+        return {"title": title, "company": company, "link": url}
+    except Exception as e:
+        logger.error(f"ATS Parsing error for {url}: {e}")
+        return None
+
+
+def execute_dork_search(role: str, location: str) -> list:
+    clean_role = role.replace('"', "").replace("'", "").strip()
+    clean_location = location.replace('"', "").replace("'", "").strip()
+    query = f'"{clean_role}" "{clean_location}" (site:boards.greenhouse.io OR site:jobs.lever.co OR site:jobs.ashbyhq.com OR site:apply.workable.com OR site:breezy.hr)'
+    links = []
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=30))
+            for r in results:
+                href = r.get("href")
+                if href:
+                    links.append(href)
+    except Exception as e:
+        logger.error(f"DDGS Search Error: {e}")
+    return links
+
+
+async def fetch_remoteok(
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    role: str,
+    location: str,
+) -> list:
+    url = "https://remoteok.com/api"
+    jobs = []
+
+    # RemoteOK API is a single call, but we still pass it through the semaphore
+    async with semaphore:
+        try:
+            async with session.get(url, headers=HEADERS, timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    for item in data[1:]:  # Skip the first metadata item
+                        title = item.get("position", "")
+                        company = item.get("company", "")
+                        link = item.get("url", "")
+                        job_loc = item.get("location", "")
+
+                        if match_role_and_location(title, job_loc, role, location):
+                            jobs.append(
+                                {"title": title, "company": company, "link": link}
+                            )
+        except Exception as e:
+            logger.error(f"RemoteOK API Error: {e}")
+    return jobs
+
+
+async def fetch_wwr(
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    role: str,
+    location: str,
+) -> list:
+    url = "https://weworkremotely.com/categories/remote-programming-jobs.rss"
+    jobs = []
+    html = await fetch_html(session, semaphore, url)
+    if not html:
+        return jobs
 
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        }
-
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(url, headers=headers, timeout=15) as resp:
-                    if resp.status == 403:
-                        raise Exception(
-                            "HTTP 403 Forbidden. The target server's firewall has blocked my access attempt."
-                        )
-                    elif resp.status == 404:
-                        raise Exception(
-                            "HTTP 404 Not Found. The requested page directory does not exist on the host."
-                        )
-                    elif resp.status != 200:
-                        raise Exception(
-                            f"Target server returned an unexpected HTTP {resp.status} status code."
-                        )
-
-                    html = await resp.text()
-            except asyncio.TimeoutError:
-                raise Exception(
-                    "Timeout Error. The target server failed to respond within acceptable parameters."
-                )
-
-        embed.description = (
-            "⏳ **Phase 2/4:** Parsing and sanitizing HTML data structures..."
-        )
-        await status_msg.edit(embed=embed)
-
         soup = BeautifulSoup(html, "html.parser")
-        for script in soup(
-            ["script", "style", "nav", "footer", "noscript", "header", "aside"]
-        ):
-            script.extract()
+        for item in soup.find_all("item"):
+            title_full = item.find("title").text if item.find("title") else ""
+            link = item.find("link").text if item.find("link") else ""
+            category = item.find("category").text if item.find("category") else ""
 
-        text = soup.get_text(separator="\n", strip=True)
-        text = re.sub(r"\n+", "\n", text)
+            parts = title_full.split(":", 1)
+            company = parts[0].strip() if len(parts) == 2 else "Unknown Company"
+            title = parts[1].strip() if len(parts) == 2 else title_full.strip()
 
-        if len(text) < 50:
-            raise Exception(
-                "Data extraction failed. The page appears to be structurally empty or heavily reliant on client-side JavaScript execution."
-            )
-
-        embed.description = (
-            "⏳ **Phase 3/4:** Executing primary query extraction matrix..."
-        )
-        await status_msg.edit(embed=embed)
-
-        main_prompt = f"Extract exactly what is requested from this text: '{extraction_query}'. Ensure the response is highly concise and strictly under 4 sentences.\n\nTEXT:\n{text[:8000]}"
-        final_text = await safe_ai_call(groq_client, main_prompt)
-
-        embed.description = "⏳ **Phase 4/4:** Generating dynamic context actions..."
-        await status_msg.edit(embed=embed)
-
-        ui_prompt = f"Based on the text below, generate exactly 3 highly relevant follow-up questions or actions a developer might want to ask. Return ONLY a valid JSON array of objects. Each object must have 'label' (max 20 chars), 'description' (max 40 chars), and 'prompt' (the exact instruction for the AI, instructing it to answer in 3 sentences max). Text snippet: {text[:2000]}"
-
-        try:
-            ui_response = await safe_ai_call(
-                groq_client,
-                ui_prompt,
-                model="llama-3.1-8b-instant",
-                response_format={"type": "json_object"},
-            )
-            clean_json = ui_response.replace("```json", "").replace("```", "").strip()
-
-            if clean_json.startswith("{") and "actions" in clean_json:
-                dynamic_actions = json.loads(clean_json)["actions"]
-            else:
-                dynamic_actions = json.loads(clean_json)
-
-            if not isinstance(dynamic_actions, list):
-                raise ValueError(
-                    "AI JSON parser failed to return a valid list structure."
-                )
-
-        except Exception as e:
-            logger.warning(f"Dynamic UI Generation Failed: {e}")
-            dynamic_actions = [
-                {
-                    "label": "Summarize Data",
-                    "description": "Provide a brief summary of the extracted text",
-                    "prompt": "Summarize the entirety of this content concisely in exactly 3 sentences.",
-                },
-                {
-                    "label": "Extract URLs",
-                    "description": "List all embedded hyperlinks and paths",
-                    "prompt": "Provide a concise list of every URL, file path, or external link mentioned in the text.",
-                },
-            ]
-
-        final_embed = discord.Embed(
-            title="✅ Web Extraction Protocol Complete",
-            description=final_text[:4096],
-            color=discord.Color.green(),
-        )
-        final_embed.add_field(
-            name="Target Source", value=f"[Access Original Data]({url})", inline=False
-        )
-
-        view = ScraperProgressView(text, groq_client, url, dynamic_actions)
-        await status_msg.edit(embed=final_embed, view=view)
-
+            if match_role_and_location(title, category, role, location):
+                jobs.append({"title": title, "company": company, "link": link.strip()})
     except Exception as e:
-        logger.error(f"Scraping Engine Catastrophic Failure: {traceback.format_exc()}")
-        embed.description = f"❌ **Task Failed:**\n```py\n{e}\n```"
-        embed.color = discord.Color.red()
-        await status_msg.edit(embed=embed)
+        logger.error(f"WWR RSS Error: {e}")
+    return jobs
+
+
+async def sweep_jobs(role: str, location: str) -> list:
+    """Main execution function utilizing a shared aiohttp session and concurrency limits."""
+    # 4. Clear cache at the start of a new sweep
+    _url_cache.clear()
+
+    # Fetch Dork Links (Blocking I/O moved to thread)
+    links = await asyncio.to_thread(execute_dork_search, role, location)
+    valid_ats = [
+        "greenhouse.io",
+        "lever.co",
+        "ashbyhq.com",
+        "workable.com",
+        "breezy.hr",
+    ]
+    filtered_links = [l for l in links if any(ats in l for ats in valid_ats)]
+
+    final_jobs = []
+    seen_links = set()  # 5. Deduplication set
+
+    # 6. Shared Session & Semaphore implementation
+    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async with aiohttp.ClientSession() as session:
+        # Create asynchronous tasks for all ATS links
+        ats_tasks = [
+            extract_ats_data(session, semaphore, link) for link in filtered_links
+        ]
+
+        # Add API/RSS tasks
+        rok_task = fetch_remoteok(session, semaphore, role, location)
+        wwr_task = fetch_wwr(session, semaphore, role, location)
+
+        # Execute all HTTP requests concurrently (throttled by semaphore)
+        results = await asyncio.gather(
+            *ats_tasks, rok_task, wwr_task, return_exceptions=True
+        )
+
+        # Process ATS results
+        ats_results = results[:-2]
+        for job_data in ats_results:
+            if isinstance(job_data, dict) and job_data["title"] != "Unknown Role":
+                if job_data["link"] not in seen_links and is_entry_level(
+                    job_data["title"]
+                ):
+                    seen_links.add(job_data["link"])
+                    final_jobs.append(job_data)
+
+        # Process API/RSS results (they return lists of dicts)
+        for api_job_list in results[-2:]:
+            if isinstance(api_job_list, list):
+                for job_data in api_job_list:
+                    if job_data["link"] not in seen_links and is_entry_level(
+                        job_data["title"]
+                    ):
+                        seen_links.add(job_data["link"])
+                        final_jobs.append(job_data)
+
+    logger.info(
+        f"Sweep complete. Extracted {len(final_jobs)} deduplicated, entry-level jobs."
+    )
+    return final_jobs
