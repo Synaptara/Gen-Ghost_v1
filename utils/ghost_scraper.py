@@ -20,7 +20,10 @@ _url_cache = set()
 
 
 def is_entry_level(title: str) -> bool:
+    """Aggressively filters out anything requiring mid-to-senior experience."""
     title_lower = title.lower()
+
+    # Expanded list to protect the fresher pipeline
     senior_terms = [
         r"\bsenior\b",
         r"\bsr\.?\b",
@@ -35,6 +38,12 @@ def is_entry_level(title: str) -> bool:
         r"\biii\b",
         r"\biv\b",
         r"\bexperienced\b",
+        r"\barchitect\b",
+        r"\bexpert\b",
+        r"\bmid-level\b",
+        r"\bmid\b",
+        r"\bpresident\b",
+        r"\bchief\b",
     ]
     return not any(re.search(term, title_lower) for term in senior_terms)
 
@@ -55,9 +64,10 @@ def match_role_and_location(
         or target_role_clean in title_lower
     )
 
-    # Location Match: Check for explicit remote or target location
+    # Location Match: Check for explicit remote or target location (e.g., India)
     loc_match = (
         "remote" in loc_lower
+        or "india" in loc_lower
         or "worldwide" in loc_lower
         or "anywhere" in loc_lower
         or target_loc_clean in loc_lower
@@ -72,7 +82,6 @@ async def fetch_html(
     """Fetches HTML with Semaphore concurrency limit, retries, and backoff."""
     clean_url = url.split("?")[0]
 
-    # 2. In-Memory Caching (Prevents double-fetching)
     if clean_url in _url_cache:
         return None
     _url_cache.add(clean_url)
@@ -86,7 +95,7 @@ async def fetch_html(
                     else:
                         logger.warning(f"HTTP {resp.status} - {clean_url}")
                         if resp.status in [403, 404]:
-                            return None  # Do not retry hard blocks or missing pages
+                            return None
             except Exception as e:
                 if attempt < MAX_RETRIES:
                     backoff = 2**attempt
@@ -109,7 +118,6 @@ async def extract_ats_data(
     soup = BeautifulSoup(html, "html.parser")
     title, company = "Unknown Role", "Unknown Company"
 
-    # 3. Robust ATS Parsing with Fallbacks
     try:
         if "greenhouse.io" in url:
             title_el = soup.find("h1", class_="app-title") or soup.find("h1")
@@ -158,11 +166,19 @@ async def extract_ats_data(
 def execute_dork_search(role: str, location: str) -> list:
     clean_role = role.replace('"', "").replace("'", "").strip()
     clean_location = location.replace('"', "").replace("'", "").strip()
-    query = f'"{clean_role}" "{clean_location}" (site:boards.greenhouse.io OR site:jobs.lever.co OR site:jobs.ashbyhq.com OR site:apply.workable.com OR site:breezy.hr)'
+
+    # 🟢 NEW: Aggressive Dork Query. Subtracts senior roles and mandates fresher keywords at the search-engine level.
+    query = (
+        f'"{clean_role}" "{clean_location}" ("fresher" OR "junior" OR "entry level" OR "intern") '
+        f"-senior -lead -manager -principal -director "
+        f"(site:boards.greenhouse.io OR site:jobs.lever.co OR site:jobs.ashbyhq.com OR site:apply.workable.com OR site:breezy.hr)"
+    )
+
     links = []
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=30))
+            # Increased max results since the strict filter will drop many of them
+            results = list(ddgs.text(query, max_results=40))
             for r in results:
                 href = r.get("href")
                 if href:
@@ -181,13 +197,12 @@ async def fetch_remoteok(
     url = "https://remoteok.com/api"
     jobs = []
 
-    # RemoteOK API is a single call, but we still pass it through the semaphore
     async with semaphore:
         try:
             async with session.get(url, headers=HEADERS, timeout=15) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
-                    for item in data[1:]:  # Skip the first metadata item
+                    for item in data[1:]:
                         title = item.get("position", "")
                         company = item.get("company", "")
                         link = item.get("url", "")
@@ -234,10 +249,8 @@ async def fetch_wwr(
 
 async def sweep_jobs(role: str, location: str) -> list:
     """Main execution function utilizing a shared aiohttp session and concurrency limits."""
-    # 4. Clear cache at the start of a new sweep
     _url_cache.clear()
 
-    # Fetch Dork Links (Blocking I/O moved to thread)
     links = await asyncio.to_thread(execute_dork_search, role, location)
     valid_ats = [
         "greenhouse.io",
@@ -249,22 +262,17 @@ async def sweep_jobs(role: str, location: str) -> list:
     filtered_links = [l for l in links if any(ats in l for ats in valid_ats)]
 
     final_jobs = []
-    seen_links = set()  # 5. Deduplication set
+    seen_links = set()
 
-    # 6. Shared Session & Semaphore implementation
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
     async with aiohttp.ClientSession() as session:
-        # Create asynchronous tasks for all ATS links
         ats_tasks = [
             extract_ats_data(session, semaphore, link) for link in filtered_links
         ]
-
-        # Add API/RSS tasks
         rok_task = fetch_remoteok(session, semaphore, role, location)
         wwr_task = fetch_wwr(session, semaphore, role, location)
 
-        # Execute all HTTP requests concurrently (throttled by semaphore)
         results = await asyncio.gather(
             *ats_tasks, rok_task, wwr_task, return_exceptions=True
         )
@@ -279,7 +287,7 @@ async def sweep_jobs(role: str, location: str) -> list:
                     seen_links.add(job_data["link"])
                     final_jobs.append(job_data)
 
-        # Process API/RSS results (they return lists of dicts)
+        # Process API/RSS results
         for api_job_list in results[-2:]:
             if isinstance(api_job_list, list):
                 for job_data in api_job_list:

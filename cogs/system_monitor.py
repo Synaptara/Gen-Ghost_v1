@@ -9,6 +9,8 @@ import time
 import re
 import logging
 import traceback
+import sqlite3
+import json
 
 logger = logging.getLogger("GhostCommander")
 
@@ -19,6 +21,32 @@ class SystemMonitor(commands.Cog):
         self.g = Github(os.getenv("GITHUB_TOKEN"))
         self.start_time = time.time()
 
+    # ==========================================
+    # OMNI-AGENT AUDIT LOGGING
+    # ==========================================
+    async def _log_action(self, action: str, details: dict):
+        """Silently logs an executed manual command to the global audit database."""
+
+        def _db_op():
+            with sqlite3.connect("data/dev_stats.db") as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO action_logs (action, timestamp, details) VALUES (?, ?, ?)",
+                    (action, int(time.time()), json.dumps(details)),
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_db_op)
+
+    async def cog_load(self):
+        """Automatically fires when the bot starts up and loads this module."""
+        await self._log_action(
+            "bot_start", {"module": "SystemMonitor", "status": "online"}
+        )
+
+    # ==========================================
+    # COMMAND: /status
+    # ==========================================
     @app_commands.command(
         name="status", description="Check bot uptime, CPU, RAM, and Battery health"
     )
@@ -44,6 +72,12 @@ class SystemMonitor(commands.Cog):
             uptime_seconds = int(time.time() - self.start_time)
             uptime_str = f"{uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m {uptime_seconds % 60}s"
 
+            # 🟢 Log the successful status check to the Omni-Agent memory
+            await self._log_action(
+                "system_status_check",
+                {"cpu_percent": cpu_usage, "ram_percent": memory.percent},
+            )
+
             if cpu_usage > 90 or memory.percent > 90:
                 color = discord.Color.red()
                 title_prefix = "🔥 CRITICAL ALERT:"
@@ -68,10 +102,17 @@ class SystemMonitor(commands.Cog):
 
         except Exception as e:
             logger.error(f"Status command crash: {traceback.format_exc()}")
+            # 🟢 Log the system error
+            await self._log_action(
+                "system_error", {"command": "status", "error": str(e)}
+            )
             await interaction.followup.send(
                 "🔥 **The server is so broken it can't even tell me how broken it is.** Check your AWS console."
             )
 
+    # ==========================================
+    # COMMAND: /workflow
+    # ==========================================
     @app_commands.command(
         name="workflow", description="Check the latest GitHub Actions workflow status"
     )
@@ -108,6 +149,11 @@ class SystemMonitor(commands.Cog):
                     f"⚠️ **Nothing to see here.** `{repo_name}` doesn't have any GitHub Actions workflows set up. Write some tests first."
                 )
 
+            # 🟢 Log the successful workflow check
+            await self._log_action(
+                "workflow_status_check", {"repo": repo.name, "runs_fetched": len(runs)}
+            )
+
             embed = discord.Embed(
                 title=f"🔄 Workflow Status: {repo.name}",
                 url=repo.html_url,
@@ -133,8 +179,61 @@ class SystemMonitor(commands.Cog):
 
         except Exception as e:
             logger.error(f"Workflow command crash: {traceback.format_exc()}")
+            # 🟢 Log the workflow checking error
+            await self._log_action(
+                "system_error",
+                {"command": "workflow", "repo": repo_name, "error": str(e)},
+            )
             await interaction.followup.send(
                 "🔥 **Catastrophic failure fetching workflows.** Look at your terminal if you want the stack trace."
+            )
+
+    # ==========================================
+    # COMMAND: /clear
+    # ==========================================
+    @app_commands.command(
+        name="clear", description="Purge messages in the current channel."
+    )
+    @app_commands.describe(
+        amount="Number of messages to delete (leave blank to wipe EVERYTHING)"
+    )
+    @app_commands.default_permissions(manage_messages=True)  # Security Gate
+    async def clear_channel(self, interaction: discord.Interaction, amount: int = None):
+        # 1. Defer the response immediately. Deleting messages takes time.
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            # 2. Execute the purge. If amount is None, it deletes everything (subject to Discord's 14-day limit).
+            deleted = await interaction.channel.purge(limit=amount)
+
+            # 3. 🟢 Log the action to the Omni-Agent memory
+            await self._log_action(
+                "channel_purge",
+                {
+                    "channel": interaction.channel.name,
+                    "messages_deleted": len(deleted),
+                    "requested_amount": amount or "ALL",
+                },
+            )
+
+            # 4. Silent UI confirmation (only you will see this message)
+            await interaction.followup.send(
+                f"✅ **Sanitization Complete.** Eradicated `{len(deleted)}` messages from #{interaction.channel.name}.",
+                ephemeral=True,
+            )
+
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "🛑 **Access Denied.** I lack the `Manage Messages` permission in this channel.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"Clear command crash: {traceback.format_exc()}")
+            await self._log_action(
+                "system_error", {"command": "clear", "error": str(e)}
+            )
+            await interaction.followup.send(
+                f"🔥 **System Error:** `{str(e)}`", ephemeral=True
             )
 
 

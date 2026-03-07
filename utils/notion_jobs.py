@@ -9,34 +9,12 @@ NOTION_JOB_DB_ID = os.getenv("NOTION_JOB_DB_ID")
 
 notion = AsyncClient(auth=NOTION_API_KEY)
 
-# Cache for the new Notion API architecture
-_cached_job_ds_id = None
-
-
-async def get_job_data_source_id():
-    """Fetches the new hidden data_source_id from the parent Database."""
-    global _cached_job_ds_id
-    if _cached_job_ds_id:
-        return _cached_job_ds_id
-
-    try:
-        db = await notion.databases.retrieve(database_id=NOTION_JOB_DB_ID)
-        _cached_job_ds_id = db["data_sources"][0]["id"]
-        return _cached_job_ds_id
-    except Exception as e:
-        logger.error(f"Failed to fetch job data_source_id: {e}")
-        return None
-
 
 async def check_job_exists(url: str) -> bool:
     """Checks if a job URL already exists in the database to prevent duplicates."""
-    ds_id = await get_job_data_source_id()
-    if not ds_id:
-        return False
-
     try:
-        response = await notion.data_sources.query(
-            data_source_id=ds_id,
+        response = await notion.databases.query(
+            database_id=NOTION_JOB_DB_ID,
             filter={"property": "Application Link", "url": {"equals": url}},
         )
         return len(response.get("results", [])) > 0
@@ -47,14 +25,10 @@ async def check_job_exists(url: str) -> bool:
 
 async def add_job_to_notion(title: str, company: str, url: str) -> str | None:
     """Adds a newly discovered job to the Notion matrix."""
-    ds_id = await get_job_data_source_id()
-    if not ds_id:
-        return None
-
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
         response = await notion.pages.create(
-            parent={"type": "data_source_id", "data_source_id": ds_id},
+            parent={"type": "database_id", "database_id": NOTION_JOB_DB_ID},
             properties={
                 "Job Title": {"title": [{"text": {"content": title}}]},
                 "Company": {"rich_text": [{"text": {"content": company}}]},

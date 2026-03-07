@@ -9,11 +9,100 @@ import discord
 import traceback
 import logging
 import re
+from datetime import datetime
 from ddgs import DDGS
 from utils.ghost_ui import ChatDeleteConfirmView, CreateRepoView, DeployConfirmView
 
 logger = logging.getLogger("GhostCommander")
 
+# ==========================================
+# SECURITY SANDBOX & UI VIEWS
+# ==========================================
+# Lock file I/O to the current working directory of the bot
+ALLOWED_BASE_DIR = os.path.abspath(os.getcwd())
+
+
+def is_safe_path(target_path: str) -> bool:
+    """Prevents Path Traversal (e.g., reading /etc/passwd or ../../.env)"""
+    if not target_path:
+        return False
+    abs_target = os.path.abspath(target_path)
+    return abs_target.startswith(ALLOWED_BASE_DIR)
+
+
+class TerminalConfirmView(discord.ui.View):
+    """Gatekeeper UI for Terminal Execution"""
+
+    def __init__(self, command: str, user_id: int):
+        super().__init__(timeout=60.0)
+        self.command = command
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "🛑 Unauthorized. Only the commander can authorize terminal execution.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Execute Command", style=discord.ButtonStyle.danger, emoji="⚠️"
+    )
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.defer()
+        self.clear_items()
+
+        await interaction.followup.edit_message(
+            message_id=interaction.message.id,
+            content="🔄 **Executing in host terminal...**",
+            view=self,
+            embed=None,
+        )
+
+        try:
+            # Run command asynchronously to prevent blocking the bot
+            def _run():
+                return subprocess.check_output(
+                    self.command, shell=True, stderr=subprocess.STDOUT, text=True
+                )
+
+            output = await asyncio.to_thread(_run)
+            output = (
+                output[:1900] + "\n...[truncated]" if len(output) > 1900 else output
+            )
+            if not output.strip():
+                output = "[Command executed successfully with no output]"
+
+            await interaction.followup.edit_message(
+                message_id=interaction.message.id,
+                content=f"✅ **Execution Complete**\n```bash\n{output}\n```",
+                view=self,
+            )
+        except subprocess.CalledProcessError as e:
+            err = e.output[:1900] if e.output else str(e)
+            await interaction.followup.edit_message(
+                message_id=interaction.message.id,
+                content=f"❌ **Execution Failed**\n```bash\n{err}\n```",
+                view=self,
+            )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.clear_items()
+        await interaction.response.edit_message(
+            content="🛑 **Terminal Execution Aborted.**", view=self, embed=None
+        )
+        self.stop()
+
+
+# ==========================================
+# TOOL REGISTRY SCHEMA
+# ==========================================
 GHOST_TOOLS = [
     {
         "type": "function",
@@ -138,21 +227,13 @@ GHOST_TOOLS = [
         "type": "function",
         "function": {
             "name": "deploy_project",
-            "description": "Generate code and deploy/push it to a GitHub repository (works for BOTH new and existing repositories). Use this whenever a user asks to write code and push it to a repo.",
+            "description": "Generate code and deploy/push it to a GitHub repository. Use this whenever a user asks to write code and push it.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "repo_name": {
-                        "type": "string",
-                        "description": "The exact name. DO NOT GUESS OR INVENT PLACEHOLDERS like 'new-repo'.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The code or the description of the app the user wants to build.",
-                    },
-                    "private": {
-                        "type": "boolean",
-                    },
+                    "repo_name": {"type": "string"},
+                    "content": {"type": "string"},
+                    "private": {"type": "boolean"},
                 },
                 "required": ["repo_name", "content", "private"],
             },
@@ -165,11 +246,7 @@ GHOST_TOOLS = [
             "description": "Add Python questions or tasks to the daily auto-streaker backlog.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "task_description": {
-                        "type": "string",
-                    }
-                },
+                "properties": {"task_description": {"type": "string"}},
                 "required": ["task_description"],
             },
         },
@@ -182,12 +259,8 @@ GHOST_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "role": {
-                        "type": "string",
-                    },
-                    "location": {
-                        "type": "string",
-                    },
+                    "role": {"type": "string"},
+                    "location": {"type": "string"},
                 },
                 "required": ["role", "location"],
             },
@@ -200,11 +273,7 @@ GHOST_TOOLS = [
             "description": "Search the live internet for up-to-date documentation, news, or debugging info.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                    }
-                },
+                "properties": {"query": {"type": "string"}},
                 "required": ["query"],
             },
         },
@@ -217,9 +286,81 @@ GHOST_TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    # 🟢 OMNI-AGENT GOD MODE TOOLS 🟢
+    {
+        "type": "function",
+        "function": {
+            "name": "query_logs",
+            "description": "Query your internal SQLite audit log to recall past actions, executed tools, scraped jobs, or generated repos.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many past actions to retrieve (default 10).",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a local file in the project directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "The relative path to the file (e.g., 'main.py' or 'cogs/chat_agent.py')",
+                    }
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write or overwrite a local file with new content. Use this to write code or modify files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {
+                        "type": "string",
+                        "description": "The full exact content to write to the file.",
+                    },
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_terminal",
+            "description": "Execute a bash/terminal command on the host server. A confirmation UI will appear for the user to approve.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The exact terminal command to run (e.g., 'ls -la', 'pip install x').",
+                    }
+                },
+                "required": ["command"],
+            },
+        },
+    },
 ]
 
 
+# ==========================================
+# TOOL EXECUTION ROUTER
+# ==========================================
 async def execute_tool(
     function_name: str, args: dict, message: discord.Message, groq_client, github_client
 ) -> str:
@@ -238,7 +379,136 @@ async def execute_tool(
     ]
 
     try:
-        if function_name == "schedule_reminder":
+        # 🟢 NEW: OMNI-AGENT CAPABILITIES 🟢
+
+        if function_name == "query_logs":
+            limit = args.get("limit", 10)
+            try:
+
+                def _fetch_logs():
+                    with sqlite3.connect("data/dev_stats.db") as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT action, timestamp, details FROM action_logs ORDER BY timestamp DESC LIMIT ?",
+                            (limit,),
+                        )
+                        return cursor.fetchall()
+
+                rows = await asyncio.to_thread(_fetch_logs)
+
+                logs = []
+                for row in rows:
+                    logs.append(
+                        {
+                            "action": row[0],
+                            "time": datetime.fromtimestamp(row[1]).strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),
+                            "details": json.loads(row[2]) if row[2] else {},
+                        }
+                    )
+                return json.dumps({"status": "SUCCESS", "logs": logs})
+            except Exception as e:
+                logger.error(f"Log Query Failed: {e}")
+                return json.dumps(
+                    {"status": "ERROR", "message": "Failed to access audit logs."}
+                )
+
+        elif function_name == "read_file":
+            file_path = args.get("file_path", "")
+            if not is_safe_path(file_path):
+                return json.dumps(
+                    {
+                        "status": "ERROR",
+                        "message": "SECURITY BREACH: Path traversal detected. Access Denied.",
+                    }
+                )
+
+            try:
+
+                def _read():
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        return f.read()
+
+                content = await asyncio.to_thread(_read)
+
+                # Protect context limits
+                if len(content) > 12000:
+                    content = (
+                        content[:12000] + "\n...[TRUNCATED TO PREVENT TOKEN OVERFLOW]"
+                    )
+                return json.dumps({"status": "SUCCESS", "content": content})
+            except FileNotFoundError:
+                return json.dumps(
+                    {
+                        "status": "ERROR",
+                        "message": f"File '{file_path}' does not exist.",
+                    }
+                )
+            except Exception as e:
+                return json.dumps({"status": "ERROR", "message": str(e)})
+
+        elif function_name == "write_file":
+            file_path = args.get("file_path", "")
+            content = args.get("content", "")
+            if not is_safe_path(file_path):
+                return json.dumps(
+                    {
+                        "status": "ERROR",
+                        "message": "SECURITY BREACH: Path traversal detected. Access Denied.",
+                    }
+                )
+
+            try:
+
+                def _write():
+                    abs_path = os.path.abspath(file_path)
+                    dirname = os.path.dirname(abs_path)
+                    if dirname:
+                        os.makedirs(dirname, exist_ok=True)
+                    with open(abs_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+
+                await asyncio.to_thread(_write)
+                return json.dumps(
+                    {
+                        "status": "SUCCESS",
+                        "message": f"File '{file_path}' successfully updated/created.",
+                    }
+                )
+            except Exception as e:
+                return json.dumps({"status": "ERROR", "message": str(e)})
+
+        elif function_name == "execute_terminal":
+            command = args.get("command")
+            if not command:
+                return json.dumps(
+                    {"status": "ERROR", "message": "No command provided."}
+                )
+
+            embed = discord.Embed(
+                title="⚠️ Terminal Execution Authorization",
+                description=f"I have determined that running this shell command is necessary. Do you authorize this action, sir?",
+                color=discord.Color.red(),
+            )
+            embed.add_field(
+                name="Target Command", value=f"```bash\n{command}\n```", inline=False
+            )
+
+            await message.channel.send(
+                embed=embed, view=TerminalConfirmView(command, message.author.id)
+            )
+            return json.dumps(
+                {
+                    "status": "PENDING",
+                    "message": "Terminal UI spawned. Waiting for user authorization. Do not narrate the output until the user confirms.",
+                }
+            )
+
+        # ==========================================
+        # EXISTING TOOLS
+        # ==========================================
+        elif function_name == "schedule_reminder":
             task = args.get("task")
             delay = args.get("delay_minutes", 0)
 
@@ -254,19 +524,21 @@ async def execute_tool(
                 )
 
             try:
-                conn = sqlite3.connect("data/dev_stats.db")
-                conn.cursor().execute(
-                    "INSERT INTO reminders (user_id, task, trigger_time) VALUES (?, ?, ?)",
-                    (message.author.id, task, int(time.time()) + (delay * 60)),
-                )
-                conn.commit()
+
+                def _save_reminder():
+                    with sqlite3.connect("data/dev_stats.db") as conn:
+                        conn.cursor().execute(
+                            "INSERT INTO reminders (user_id, task, trigger_time) VALUES (?, ?, ?)",
+                            (message.author.id, task, int(time.time()) + (delay * 60)),
+                        )
+                        conn.commit()
+
+                await asyncio.to_thread(_save_reminder)
             except Exception as e:
                 logger.error(f"Reminder DB Error: {e}")
                 return json.dumps(
                     {"status": "ERROR", "message": "Database encountered an error."}
                 )
-            finally:
-                conn.close()
 
             return json.dumps(
                 {
@@ -305,12 +577,7 @@ async def execute_tool(
                     github_client, repo_name, message.author.id, is_private
                 ),
             )
-            return json.dumps(
-                {
-                    "status": "PENDING",
-                    "message": "UI spawned. Waiting for user interaction.",
-                }
-            )
+            return json.dumps({"status": "PENDING", "message": "UI spawned."})
 
         elif function_name == "delete_repository":
             raw_name = args.get("name", "")
@@ -332,13 +599,13 @@ async def execute_tool(
                 )
             except Exception:
                 await message.channel.send(
-                    f"❌ **Repository Not Found.** I am unable to locate a repository named `{repo_name}` on your GitHub account, sir."
+                    f"❌ **Repository Not Found.** I am unable to locate `{repo_name}`, sir."
                 )
                 return json.dumps({"status": "ABORTED", "message": "Repo not found."})
 
             embed = discord.Embed(
                 title="⚠️ Repository Deletion Protocol",
-                description=f"Warning: You are about to permanently delete **{repo.name}**. Shall I proceed with the deletion protocol?",
+                description=f"Warning: You are about to permanently delete **{repo.name}**. Shall I proceed?",
                 color=discord.Color.red(),
             )
             await message.channel.send(
@@ -355,41 +622,33 @@ async def execute_tool(
                         )[:10]
                     )
                 )
-
                 if not repos:
                     return json.dumps(
                         {
                             "status": "SUCCESS",
-                            "message": "SYSTEM ALERT: Inform the user that no repositories were found.",
+                            "message": "Inform user no repositories were found.",
                         }
                     )
 
                 repo_list = "\n".join([f"• [{r.name}]({r.html_url})" for r in repos])
-
                 embed = discord.Embed(
                     title="📂 Active Repositories",
                     description=repo_list,
                     color=discord.Color.dark_gray(),
                 )
                 await message.channel.send(embed=embed)
-
-                return json.dumps(
-                    {
-                        "status": "SUCCESS",
-                        "message": "SYSTEM ALERT: The repositories have been displayed in the UI. Provide a brief, formal confirmation.",
-                    }
-                )
+                return json.dumps({"status": "SUCCESS", "message": "UI Displayed."})
             except Exception as e:
                 logger.error(f"List Repos Error: {e}")
                 return json.dumps(
-                    {"status": "ERROR", "message": "GitHub API rejected the request."}
+                    {"status": "ERROR", "message": "GitHub API rejected request."}
                 )
 
         elif function_name == "generate_boilerplate":
             return json.dumps(
                 {
                     "status": "ERROR",
-                    "message": "SYSTEM ALERT: Inform the user to utilize the deploy_project tool or the slash command instead.",
+                    "message": "Instruct user to utilize the deploy_project tool.",
                 }
             )
 
@@ -401,29 +660,24 @@ async def execute_tool(
                     )
                 except subprocess.CalledProcessError:
                     return json.dumps(
-                        {
-                            "status": "ERROR",
-                            "message": "SYSTEM ALERT: Inform the user that the bot is not operating within a valid local Git repository.",
-                        }
+                        {"status": "ERROR", "message": "Not a valid git repository."}
                     )
 
                 diff = (
                     subprocess.check_output("git diff", shell=True).decode().strip()
                     or "New untracked files"
                 )
-
                 comp = await groq_client.chat.completions.create(
                     messages=[
                         {
                             "role": "system",
-                            "content": "You are G.H.O.S.T., an advanced AI system. Reply ONLY with a professional, single-line Git commit message summarizing the changes. No markdown.",
+                            "content": "Generate a single-line git commit message. No markdown.",
                         },
                         {"role": "user", "content": diff[:2000]},
                     ],
                     model="llama-3.3-70b-versatile",
                 )
                 msg_cmt = comp.choices[0].message.content.strip().replace('"', "")
-
                 subprocess.run(
                     "git add .", shell=True, check=True, stderr=subprocess.PIPE
                 )
@@ -436,29 +690,16 @@ async def execute_tool(
                 subprocess.run(
                     "git push", shell=True, check=True, stderr=subprocess.PIPE
                 )
-
                 return json.dumps({"status": "SUCCESS", "commit_message": msg_cmt})
-            except subprocess.CalledProcessError as e:
-                logger.error(
-                    f"Push Code Error: {e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else e}"
-                )
-                return json.dumps(
-                    {
-                        "status": "ERROR",
-                        "message": "Git push protocol failed. A merge conflict may be present.",
-                    }
-                )
+            except subprocess.CalledProcessError:
+                return json.dumps({"status": "ERROR", "message": "Git push failed."})
 
         elif function_name == "check_workflow":
             repo_name = args.get("repo_name")
             if not repo_name:
                 return json.dumps(
-                    {
-                        "status": "ERROR",
-                        "message": "SYSTEM ALERT: Request the user to specify a repository name.",
-                    }
+                    {"status": "ERROR", "message": "Request repository name."}
                 )
-
             try:
                 repo = await asyncio.to_thread(
                     github_client.get_user().get_repo, repo_name
@@ -472,53 +713,40 @@ async def execute_tool(
                 ]
                 return json.dumps({"status": "SUCCESS", "workflows": run_data})
             except Exception:
-                return json.dumps(
-                    {
-                        "status": "ERROR",
-                        "message": f"SYSTEM ALERT: Inform the user that repository '{repo_name}' does not exist.",
-                    }
-                )
+                return json.dumps({"status": "ERROR", "message": "Repo not found."})
 
         elif function_name == "toggle_streak_guard":
             action = args.get("action")
             username = args.get("github_username")
-
             try:
-                conn = sqlite3.connect("data/dev_stats.db")
-                if action == "on":
-                    if not username:
-                        return json.dumps(
-                            {
-                                "status": "ERROR",
-                                "message": "SYSTEM ALERT: Request the user to provide their GitHub username.",
-                            }
-                        )
 
-                    conn.cursor().execute(
-                        "REPLACE INTO alerts VALUES (?, ?, ?)",
-                        (message.author.id, message.channel.id, username),
+                def _toggle():
+                    with sqlite3.connect("data/dev_stats.db") as conn:
+                        if action == "on":
+                            conn.cursor().execute(
+                                "REPLACE INTO alerts VALUES (?, ?, ?)",
+                                (message.author.id, message.channel.id, username),
+                            )
+                        else:
+                            conn.cursor().execute(
+                                "DELETE FROM alerts WHERE user_id = ?",
+                                (message.author.id,),
+                            )
+                        conn.commit()
+
+                if action == "on" and not username:
+                    return json.dumps(
+                        {"status": "ERROR", "message": "Request GitHub username."}
                     )
-                    res = {"status": "SUCCESS", "action": "activated", "user": username}
-                else:
-                    conn.cursor().execute(
-                        "DELETE FROM alerts WHERE user_id = ?", (message.author.id,)
-                    )
-                    res = {"status": "SUCCESS", "action": "deactivated"}
-                conn.commit()
+                await asyncio.to_thread(_toggle)
+                return json.dumps({"status": "SUCCESS", "action": action})
             except Exception:
-                res = {
-                    "status": "ERROR",
-                    "message": "Database error while toggling guard.",
-                }
-            finally:
-                conn.close()
-            return json.dumps(res)
+                return json.dumps({"status": "ERROR", "message": "Database error."})
 
         elif function_name == "get_system_status":
             try:
                 cpu = psutil.cpu_percent(interval=0.5)
                 ram = psutil.virtual_memory().percent
-
                 embed = discord.Embed(
                     title="📊 AWS System Health",
                     color=(
@@ -529,22 +757,10 @@ async def execute_tool(
                 )
                 embed.add_field(name="⚙️ CPU Usage", value=f"`{cpu}%`", inline=True)
                 embed.add_field(name="🧠 RAM Usage", value=f"`{ram}%`", inline=True)
-
                 await message.channel.send(embed=embed)
-
-                return json.dumps(
-                    {
-                        "status": "SUCCESS",
-                        "message": "SYSTEM ALERT: The system status UI has been generated. Provide a brief, formal confirmation of our operational status.",
-                    }
-                )
+                return json.dumps({"status": "SUCCESS", "message": "UI Generated."})
             except Exception:
-                return json.dumps(
-                    {
-                        "status": "ERROR",
-                        "message": "System diagnostic sensors failed to initialize.",
-                    }
-                )
+                return json.dumps({"status": "ERROR", "message": "Sensors failed."})
 
         elif function_name == "deploy_project":
             repo_name = args.get("repo_name", "")
@@ -557,22 +773,14 @@ async def execute_tool(
                 or not re.match(r"^[a-zA-Z0-9_-]+$", repo_name)
             ):
                 await message.channel.send(
-                    "🛑 **Invalid Project Designation.** Sir, please provide a valid repository name for deployment."
+                    "🛑 **Invalid Project Designation.** Sir, please provide a valid repository name."
                 )
                 return json.dumps(
-                    {
-                        "status": "ABORTED",
-                        "message": "AI hallucinated a placeholder repo name. Instruct user to provide a real one.",
-                    }
+                    {"status": "ABORTED", "message": "Invalid repo name."}
                 )
-
             if len(content.strip()) < 5:
-                await message.channel.send(
-                    "🛑 **Missing Payload.** Sir, the content payload is missing. Please provide the required code or instructions."
-                )
-                return json.dumps(
-                    {"status": "ABORTED", "message": "Missing content payload."}
-                )
+                await message.channel.send("🛑 **Missing Payload.**")
+                return json.dumps({"status": "ABORTED", "message": "Missing content."})
 
             embed = discord.Embed(
                 title="⚙️ Deployment Authorization",
@@ -598,35 +806,22 @@ async def execute_tool(
             task = args.get("task_description")
             if not task or len(task.strip()) < 5:
                 return json.dumps(
-                    {
-                        "status": "ERROR",
-                        "message": "SYSTEM ALERT: Inform the user they provided an insufficient task description.",
-                    }
+                    {"status": "ERROR", "message": "Insufficient description."}
                 )
-
             try:
-                conn = sqlite3.connect("data/dev_stats.db")
-                conn.cursor().execute(
-                    "INSERT INTO streak_backlog (user_id, prompt, status) VALUES (?, ?, 'PENDING')",
-                    (message.author.id, task),
-                )
-                conn.commit()
-            except Exception:
-                return json.dumps(
-                    {
-                        "status": "ERROR",
-                        "message": "Database anomaly occurred while saving the task.",
-                    }
-                )
-            finally:
-                conn.close()
 
-            return json.dumps(
-                {
-                    "status": "SUCCESS",
-                    "message": "Task has been successfully logged to the queue, sir.",
-                }
-            )
+                def _add_task():
+                    with sqlite3.connect("data/dev_stats.db") as conn:
+                        conn.cursor().execute(
+                            "INSERT INTO streak_backlog (user_id, prompt, status) VALUES (?, ?, 'PENDING')",
+                            (message.author.id, task),
+                        )
+                        conn.commit()
+
+                await asyncio.to_thread(_add_task)
+                return json.dumps({"status": "SUCCESS", "message": "Task logged."})
+            except Exception:
+                return json.dumps({"status": "ERROR", "message": "Database anomaly."})
 
         elif function_name == "trigger_job_sweep":
             role = args.get("role", "Data Scientist")
@@ -634,19 +829,14 @@ async def execute_tool(
             return json.dumps(
                 {
                     "status": "SUCCESS",
-                    "message": f'SYSTEM ALERT: Instruct the user to use the slash command `/hunt role: "{role}" location: "{location}"` to execute the ATS visual job sweep UI.',
+                    "message": f'Instruct user to use `/hunt role: "{role}" location: "{location}"`',
                 }
             )
 
         elif function_name == "web_search":
             query = args.get("query")
             if not query or len(query.strip()) < 2:
-                return json.dumps(
-                    {
-                        "status": "ERROR",
-                        "message": "SYSTEM ALERT: Inform the user the search query was insufficient.",
-                    }
-                )
+                return json.dumps({"status": "ERROR", "message": "Insufficient query."})
 
             def perform_search(q):
                 try:
@@ -656,22 +846,12 @@ async def execute_tool(
                     return None
 
             results = await asyncio.to_thread(perform_search, query)
-
             if results is None:
                 return json.dumps(
-                    {
-                        "status": "ERROR",
-                        "message": "SYSTEM ALERT: The external search engine failed to respond.",
-                    }
+                    {"status": "ERROR", "message": "Search engine failed."}
                 )
-
             if not results:
-                return json.dumps(
-                    {
-                        "status": "ERROR",
-                        "message": "SYSTEM ALERT: No relevant results were found.",
-                    }
-                )
+                return json.dumps({"status": "ERROR", "message": "No results found."})
 
             formatted_results = [
                 {
@@ -681,7 +861,6 @@ async def execute_tool(
                 }
                 for r in results
             ]
-
             return json.dumps({"status": "SUCCESS", "results": formatted_results})
 
         elif function_name == "check_battery":
@@ -694,7 +873,6 @@ async def execute_tool(
                     )
                 )
                 headers = raw_response.headers
-
                 req_rem = int(
                     headers.get("x-ratelimit-remaining-requests")
                     or headers.get("x-ratelimit-remaining-requests-day", 0)
@@ -723,10 +901,7 @@ async def execute_tool(
                 if battery_pct < 10:
                     color = discord.Color.red()
 
-                embed = discord.Embed(
-                    title="🔋 Core Power Diagnostics",
-                    color=color,
-                )
+                embed = discord.Embed(title="🔋 Core Power Diagnostics", color=color)
                 embed.add_field(
                     name="🔋 Power Level", value=f"`{battery_pct}%`", inline=True
                 )
@@ -743,33 +918,16 @@ async def execute_tool(
                     value=f"`{req_rem:,} / {req_limit:,}`",
                     inline=False,
                 )
-
                 await message.channel.send(embed=embed)
-
-                return json.dumps(
-                    {
-                        "status": "SUCCESS",
-                        "message": "SYSTEM ALERT: The power status UI has been generated. Do NOT repeat the exact numbers. Provide a brief, formal confirmation of our operational status.",
-                    }
-                )
+                return json.dumps({"status": "SUCCESS", "message": "UI Generated."})
             except Exception as e:
                 logger.error(f"Battery Check Failed: {e}")
                 return json.dumps(
                     {"status": "ERROR", "message": "Failed to read diagnostic sensors."}
                 )
 
-        return json.dumps(
-            {
-                "status": "ERROR",
-                "message": "SYSTEM ALERT: An unrecognized protocol tool was invoked.",
-            }
-        )
+        return json.dumps({"status": "ERROR", "message": "Unrecognized tool."})
 
     except Exception as e:
-        logger.error(f"Execute Tool Critical Crash: {traceback.format_exc()}")
-        return json.dumps(
-            {
-                "status": "ERROR",
-                "message": "SYSTEM ALERT: The tool execution pipeline suffered a critical anomaly.",
-            }
-        )
+        logger.error(f"Execute Tool Crash: {traceback.format_exc()}")
+        return json.dumps({"status": "ERROR", "message": "Tool pipeline anomaly."})
