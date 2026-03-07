@@ -1,0 +1,12 @@
+services:
+  ghostcommander:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ghostcommander
+    env_file:
+      - .env
+    restart: unless-stopped
+    init: true
+    volumes:
+      - ./data:/app/data
