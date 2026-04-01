@@ -17,13 +17,20 @@ except Exception as e:
 async def generate_response(messages: list) -> str:
     """
     Sends a conversation thread to the Groq API and returns the text response.
+
+    NOTE: This utility client is used by standalone cogs (e.g. trackers, scrapers).
+    The ChatAgent cog manages its own AsyncGroq instance directly.
+    FIX: Updated model from deprecated 'llama3-70b-8192' to 'llama-3.3-70b-versatile'.
     """
     if not client:
         return "❌ Warning: Groq API client is offline. Check your GROQ_API_KEY in the .env file."
 
     try:
         response = await client.chat.completions.create(
-            model="llama3-70b-8192", messages=messages, temperature=0.7, max_tokens=1024
+            model="llama-3.3-70b-versatile",  # FIX: was 'llama3-70b-8192' (deprecated)
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1024,
         )
         return response.choices[0].message.content
     except Exception as e:

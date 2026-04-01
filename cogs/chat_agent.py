@@ -24,12 +24,29 @@ class ChatAgent(commands.Cog):
         self.groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
         self.g = Github(os.getenv("GITHUB_TOKEN"))
         self.log_channel_id = int(os.getenv("LOG_CHANNEL_ID", 0))
-
         self.valid_tool_names = {t["function"]["name"] for t in GHOST_TOOLS}
 
-        asyncio.create_task(self._init_db())
+        # FIX: Do NOT call asyncio.create_task() here — event loop may not be
+        # running yet during __init__. DB init is moved to cog_load() below.
+
+    async def cog_load(self):
+        """
+        Called by discord.py automatically after the Cog is loaded and the
+        event loop is guaranteed to be running. Safe place for async startup work.
+        """
+        await self._init_db()
         self.memory_cleanup.start()
         self.reminder_loop.start()
+        logger.info("✅ ChatAgent DB initialized and background tasks started.")
+
+    async def cog_unload(self):
+        """Cleanly cancel background tasks when the cog is unloaded."""
+        self.memory_cleanup.cancel()
+        self.reminder_loop.cancel()
+
+    # ==========================================
+    # DB HELPERS
+    # ==========================================
 
     async def _execute_db(self, query: str, params: tuple = ()):
         def _db_op():
@@ -50,17 +67,61 @@ class ChatAgent(commands.Cog):
         return await asyncio.to_thread(_db_op)
 
     async def _init_db(self):
+        """
+        Create all required tables if they do not already exist.
+        FIX: Added missing `alerts` and `streak_backlog` tables that were
+        referenced in ghost_tools.py but never created — caused runtime crashes.
+        """
+        # Core agent tables
         await self._execute_db(
-            "CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, task TEXT, trigger_time INTEGER)"
+            """CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                task TEXT,
+                trigger_time INTEGER
+            )"""
+        )
+        await self._execute_db(
+            """CREATE TABLE IF NOT EXISTS chat_memory (
+                user_id INTEGER PRIMARY KEY,
+                messages_json TEXT,
+                last_updated INTEGER
+            )"""
+        )
+        await self._execute_db(
+            """CREATE TABLE IF NOT EXISTS action_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT,
+                timestamp INTEGER,
+                details TEXT
+            )"""
         )
 
+        # FIX: streak_guard toggle writes to this table — was never created
         await self._execute_db(
-            "CREATE TABLE IF NOT EXISTS chat_memory (user_id INTEGER PRIMARY KEY, messages_json TEXT, last_updated INTEGER)"
+            """CREATE TABLE IF NOT EXISTS alerts (
+                user_id INTEGER PRIMARY KEY,
+                channel_id INTEGER,
+                github_username TEXT
+            )"""
         )
 
+        # FIX: add_to_backlog writes to this table — was never created
         await self._execute_db(
-            "CREATE TABLE IF NOT EXISTS action_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT, timestamp INTEGER, details TEXT)"
+            """CREATE TABLE IF NOT EXISTS streak_backlog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                prompt TEXT,
+                status TEXT DEFAULT 'PENDING',
+                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )"""
         )
+
+        logger.info("✅ All database tables verified/created.")
+
+    # ==========================================
+    # AUDIT LOGGING
+    # ==========================================
 
     async def log_action(self, action: str, details: dict):
         try:
@@ -71,8 +132,13 @@ class ChatAgent(commands.Cog):
         except Exception as e:
             logger.error(f"Audit Log Failure: {e}")
 
+    # ==========================================
+    # BACKGROUND TASKS
+    # ==========================================
+
     @tasks.loop(minutes=5)
     async def memory_cleanup(self):
+        """Purge chat memory older than 15 minutes (900 seconds)."""
         await self._execute_db(
             "DELETE FROM chat_memory WHERE ? - last_updated > 900", (int(time.time()),)
         )
@@ -87,38 +153,44 @@ class ChatAgent(commands.Cog):
 
         for r_id, user_id, task in rows or []:
             log_chan = self.bot.get_channel(self.log_channel_id)
-
             if log_chan:
                 embed = discord.Embed(
                     title="⏰ WAKE UP",
                     description=f"<@{user_id}>\n**You told me to remind you about this:** {task}\nNow go do it.",
                     color=discord.Color.gold(),
                 )
-
                 await log_chan.send(embed=embed)
-
             await self._execute_db("DELETE FROM reminders WHERE id = ?", (r_id,))
 
     @reminder_loop.before_loop
     async def before_reminder_loop(self):
         await self.bot.wait_until_ready()
 
+    @memory_cleanup.before_loop
+    async def before_memory_cleanup(self):
+        await self.bot.wait_until_ready()
+
+    # ==========================================
+    # MEMORY MANAGEMENT
+    # ==========================================
+
     async def load_memory(self, user_id: int) -> list:
         row = await self._fetch_db(
             "SELECT messages_json FROM chat_memory WHERE user_id = ?", (user_id,)
         )
-
         return json.loads(row[0]) if row else []
 
     async def save_memory(self, user_id: int, messages: list):
         trimmed_messages = messages[-20:]
-
         await self._execute_db(
             "REPLACE INTO chat_memory (user_id, messages_json, last_updated) VALUES (?, ?, ?)",
             (user_id, json.dumps(trimmed_messages), int(time.time())),
         )
-
         return trimmed_messages
+
+    # ==========================================
+    # GROQ API WRAPPER
+    # ==========================================
 
     async def safe_chat_completion(self, payload: list, use_tools: bool = True):
         kwargs = {"messages": payload, "max_tokens": 800}
@@ -126,7 +198,10 @@ class ChatAgent(commands.Cog):
         if use_tools:
             kwargs["tools"] = GHOST_TOOLS
             kwargs["tool_choice"] = "auto"
-            kwargs["parallel_tool_calls"] = True
+            # FIX: parallel_tool_calls disabled — prevents two UI views spawning
+            # simultaneously when AI wants to call multiple tools at once.
+            # Sequential execution is required for safety and UX coherence.
+            kwargs["parallel_tool_calls"] = False
 
         try:
             kwargs["model"] = "llama-3.3-70b-versatile"
@@ -140,7 +215,7 @@ class ChatAgent(commands.Cog):
                 return await self.groq_client.chat.completions.create(**kwargs)
 
             except Exception as fallback_err:
-                logger.error(f"Fallback failed {fallback_err}")
+                logger.error(f"Fallback model also failed: {fallback_err}")
 
                 if use_tools:
                     kwargs.pop("tools", None)
@@ -148,27 +223,28 @@ class ChatAgent(commands.Cog):
                     kwargs.pop("parallel_tool_calls", None)
 
                     error_payload = payload.copy()
-
-                    error_payload.append(
-                        {
-                            "role": "system",
-                            "content": "SYSTEM ALERT: Tool execution pipeline crashed. Apologize briefly.",
-                        }
-                    )
-
+                    error_payload.append({
+                        "role": "system",
+                        "content": "SYSTEM ALERT: Tool execution pipeline crashed. Apologize briefly.",
+                    })
                     kwargs["messages"] = error_payload
-
                     return await self.groq_client.chat.completions.create(**kwargs)
 
                 raise fallback_err
 
+    # ==========================================
+    # SAFETY: DETECT INTERNAL PROMPT LEAKAGE
+    # ==========================================
+
     def _contains_leakage(self, content: str) -> bool:
         if not content:
             return False
-
         leak_triggers = ["<function=", '{"type": "function"', '{"name":']
-
         return any(trigger in content for trigger in leak_triggers)
+
+    # ==========================================
+    # MAIN MESSAGE HANDLER
+    # ==========================================
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -176,37 +252,32 @@ class ChatAgent(commands.Cog):
             return
 
         user_text = message.content.strip()
-
         if not user_text:
             return
 
         uid = message.author.id
-
         user_memory = await self.load_memory(uid)
         user_memory.append({"role": "user", "content": user_text})
 
         async with message.channel.typing():
             try:
-
-                system_prompt = f"""
-You are G.H.O.S.T., a professional AI assistant.
+                system_prompt = f"""You are G.H.O.S.T., a professional AI assistant.
 Current Time: {datetime.now().strftime('%A, %B %d, %Y - %I:%M %p')}
 
 Rules:
-1. Use tools ONLY if user asks for action
-2. Be professional
-3. Max 3 sentences
-4. Never output raw JSON
+1. Use tools ONLY if the user explicitly asks for an action.
+2. Be professional and direct.
+3. Keep responses to 3 sentences max unless explaining an error.
+4. Never output raw JSON or internal function schemas.
+5. For PENDING tool results, do not narrate the outcome — the UI handles it.
 """
-
                 payload = [{"role": "system", "content": system_prompt}] + user_memory
 
                 res = await self.safe_chat_completion(payload, True)
-
                 response_msg = res.choices[0].message
 
                 if response_msg.tool_calls:
-
+                    # Append assistant message with tool_calls to payload
                     assistant_msg = {
                         "role": "assistant",
                         "content": response_msg.content,
@@ -222,38 +293,31 @@ Rules:
                             for tc in response_msg.tool_calls
                         ],
                     }
-
                     user_memory.append(assistant_msg)
                     payload.append(assistant_msg)
 
-                    if response_msg.content and not self._contains_leakage(
-                        response_msg.content
-                    ):
+                    # Send any pre-tool commentary (if clean)
+                    if response_msg.content and not self._contains_leakage(response_msg.content):
                         await message.channel.send(response_msg.content)
 
+                    # Execute tools sequentially (parallel_tool_calls=False guarantees only 1)
                     for tool in response_msg.tool_calls:
-
                         tool_name = tool.function.name
 
                         if tool_name not in self.valid_tool_names:
-
-                            tool_result = json.dumps(
-                                {
-                                    "status": "ERROR",
-                                    "message": f"Tool '{tool_name}' does not exist",
-                                }
-                            )
-
+                            tool_result = json.dumps({
+                                "status": "ERROR",
+                                "message": f"Tool '{tool_name}' does not exist.",
+                            })
                         else:
                             try:
                                 args = json.loads(tool.function.arguments)
-                            except:
+                            except (json.JSONDecodeError, Exception):
                                 args = {}
 
                             tool_result = await execute_tool(
                                 tool_name, args, message, self.groq_client, self.g
                             )
-
                             await self.log_action(tool_name, args)
 
                         tool_msg = {
@@ -262,69 +326,50 @@ Rules:
                             "name": tool_name,
                             "content": tool_result,
                         }
-
                         user_memory.append(tool_msg)
                         payload.append(tool_msg)
 
+                    # Final response after tool results
                     final_res = await self.safe_chat_completion(payload, False)
-
                     final_text = final_res.choices[0].message.content
 
                     user_memory.append({"role": "assistant", "content": final_text})
-
                     await self.save_memory(uid, user_memory)
-
                     await message.channel.send(final_text)
 
                 elif response_msg.content:
-
                     if self._contains_leakage(response_msg.content):
-
                         await message.channel.send(
-                            "Processing logic leaked. Please retry."
+                            "⚠️ Internal processing error. Please retry your request."
                         )
-
                         return
 
-                    user_memory.append(
-                        {"role": "assistant", "content": response_msg.content}
-                    )
-
+                    user_memory.append({"role": "assistant", "content": response_msg.content})
                     await self.save_memory(uid, user_memory)
-
                     await message.channel.send(response_msg.content)
 
             except Exception as e:
-
                 error_trace = traceback.format_exc()
-
                 logger.error(error_trace)
 
                 log_chan = self.bot.get_channel(self.log_channel_id)
-
                 if log_chan:
-
                     embed = discord.Embed(
                         title="⚠️ System Failure Detected",
                         color=discord.Color.red(),
                     )
-
                     embed.add_field(
-                        name="Error Type",
-                        value=f"`{type(e).__name__}`",
-                        inline=False,
+                        name="Error Type", value=f"`{type(e).__name__}`", inline=False
                     )
-
                     embed.add_field(
                         name="Traceback",
                         value=f"```py\n{error_trace[-1000:]}\n```",
                         inline=False,
                     )
-
                     await log_chan.send(embed=embed)
 
                 await message.channel.send(
-                    "Critical system failure detected. Intervention required."
+                    "⚠️ Critical system failure detected. Intervention required."
                 )
 
 
